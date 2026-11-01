@@ -1,0 +1,63 @@
+name: Build relay image
+
+# Relay + PWA only. Manually triggered; does not build the desktop application.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: relay-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Build and test Linux amd64 image
+        run: |
+          docker build --platform linux/amd64 \
+            --file relay-server/Dockerfile \
+            --label org.opencontainers.image.source="https://github.com/$GITHUB_REPOSITORY" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --tag "mini-term-relay:$GITHUB_SHA" .
+
+      - name: Smoke test packaged service and PWA
+        run: |
+          docker run --detach --name relay-smoke \
+            --publish 127.0.0.1:8080:8080 \
+            --env MT_RELAY_DESKTOP_KEY=ci-smoke-not-a-production-key \
+            "mini-term-relay:$GITHUB_SHA"
+          trap 'docker logs relay-smoke; docker rm --force relay-smoke' EXIT
+          curl --fail --retry 15 --retry-connrefused --retry-delay 1 \
+            http://127.0.0.1:8080/healthz | grep -x ok
+          curl --fail http://127.0.0.1:8080/ | grep 'type="module"'
+          test "$(docker inspect --format '{{.Config.User}}' relay-smoke)" = relay
+          test "$(docker inspect --format '{{len .Mounts}}' relay-smoke)" = 0
+          docker logs relay-smoke 2>&1 | grep 'desktop key configured'
+
+      - name: Export image
+        run: |
+          mkdir -p dist
+          docker save "mini-term-relay:$GITHUB_SHA" | gzip -1 > dist/mini-term-relay-linux-amd64.tar.gz
+          printf '%s\n' "$GITHUB_SHA" > dist/SOURCE_COMMIT.txt
+
+      - name: Publish downloadable image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="relay-${GITHUB_SHA:0:12}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --target "$GITHUB_SHA" --latest=false \
+              --title "Relay Linux amd64 (${GITHUB_SHA:0:12})" \
+              --notes "Relay and bundled PWA built from $GITHUB_SHA. Includes Relay protocol tests and packaged HTTP/PWA smoke checks. Load with: gzip -dc mini-term-relay-linux-amd64.tar.gz | docker load. Desktop application is not included."
+          fi
